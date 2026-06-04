@@ -175,7 +175,12 @@ def _expand_events_to_units(events: List[LyricEvent]) -> List[LyricEvent]:
     return expanded
 
 
-def parse_lyric_file(lyric_file_path: str, split_units: bool = False) -> List[LyricEvent]:
+def parse_lyric_file(
+    lyric_file_path: str, 
+    split_units: bool = False,
+    remove_parentheses: bool = False,
+    ignore_keywords: List[str] = None
+) -> List[LyricEvent]:
     ext = os.path.splitext(lyric_file_path)[1].lower()
     is_karaoke = False
     if ext == ".lrc":
@@ -188,6 +193,34 @@ def parse_lyric_file(lyric_file_path: str, split_units: bool = False) -> List[Ly
             events = _parse_karaoke_script_file(lyric_file_path)
         else:
             events = _parse_delimited_file(lyric_file_path)
+
+    # 执行文本过滤
+    if ignore_keywords is None:
+        ignore_keywords = []
+    ignore_keywords = [k.lower().strip() for k in ignore_keywords if k.strip()]
+
+    filtered_events = []
+    for e in events:
+        text_lower = e.text.lower()
+        # 如果包含忽略关键词，整句丢弃
+        if any(kw in text_lower for kw in ignore_keywords):
+            continue
+            
+        text = e.text
+        if remove_parentheses:
+            # 移除各类括号及其内部内容
+            text = re.sub(r'\(.*?\)', '', text)
+            text = re.sub(r'（.*?）', '', text)
+            text = re.sub(r'\[.*?\]', '', text)
+            text = re.sub(r'【.*?】', '', text)
+            text = re.sub(r'<.*?>', '', text)
+            text = re.sub(r'《.*?》', '', text)
+            
+        text = text.strip()
+        if text:
+            filtered_events.append(LyricEvent(time_seconds=e.time_seconds, text=text, source_line=e.source_line))
+            
+    events = filtered_events
 
     events.sort(key=lambda x: x.time_seconds)
     if split_units and not is_karaoke:
@@ -467,6 +500,7 @@ def _estimate_global_offset(lyric_times: List[float], note_times: List[float], m
     return best_diffs[len(best_diffs) // 2]
 
 
+
 def _estimate_local_offsets(lyric_times: List[float], note_times: List[float], global_offset: float) -> List[float]:
     """估计局部的动态时间偏移量，以应对节拍波动和渐变的时间差"""
     if not lyric_times or not note_times:
@@ -531,10 +565,172 @@ def _estimate_local_offsets(lyric_times: List[float], note_times: List[float], g
     return local_offsets
 
 
+def _estimate_phrase_offsets(
+    lyric_events: List[LyricEvent],
+    note_events: List[NoteEvent],
+    global_offset: float,
+    lyric_is_start: List[bool],
+    note_is_start: List[bool]
+) -> List[float]:
+    """估计整句的偏移量（逐句首字差值）。
+    
+    为了避免句首匹配误判导致整句整体偏移跳变，本实现以「全局平均差值」为基线：
+    - 先计算 global_offset + local_offsets（锚点插值）作为 baseline
+    - 再用句首歌词与句首音符进行 DP 配对，得到每句的“微调 correction”
+    - 对 correction 进行离群剔除、插值和平滑，再叠加回 baseline
+    """
+    M = len(lyric_events)
+    N = len(note_events)
+    if M == 0:
+        return []
+    if N == 0:
+        return [global_offset] * M
+        
+    note_times = [n.time_seconds for n in note_events]
+    original_lyric_times = [e.time_seconds for e in lyric_events]
+    base_local_offsets = _estimate_local_offsets(original_lyric_times, note_times, global_offset)
+    baseline_times = [original_lyric_times[i] + global_offset + base_local_offsets[i] for i in range(M)]
+    
+    lyric_phrases = []
+    current_phrase = []
+    for i in range(M):
+        if lyric_is_start[i]:
+            if current_phrase:
+                lyric_phrases.append(current_phrase)
+            current_phrase = [i]
+        else:
+            current_phrase.append(i)
+    if current_phrase:
+        lyric_phrases.append(current_phrase)
+        
+    note_starts = [j for j in range(N) if note_is_start[j]]
+    
+    L_P = len(lyric_phrases)
+    N_P = len(note_starts)
+    
+    if L_P == 0 or N_P == 0:
+        return [global_offset + base_local_offsets[i] for i in range(M)]
+        
+    # DP 匹配歌词句首与音符句首
+    dp = [[(0, 0.0)] * (N_P + 1) for _ in range(L_P + 1)]
+    tb = [[0] * (N_P + 1) for _ in range(L_P + 1)]
+    
+    tolerance = 0.8  # baseline 校正后，句首允许的误差应较小，避免重复节奏下误配
+    
+    for i in range(1, L_P + 1):
+        start_idx = lyric_phrases[i-1][0]
+        l_time = baseline_times[start_idx]
+        
+        for j in range(1, N_P + 1):
+            n_idx = note_starts[j-1]
+            n_time = note_events[n_idx].time_seconds
+            
+            best_m, best_e = dp[i][j-1]
+            action = 3
+            
+            sm, se = dp[i-1][j]
+            if sm > best_m or (sm == best_m and se > best_e):
+                best_m, best_e = sm, se
+                action = 2
+                
+            diff = abs(l_time - n_time)
+            if diff <= tolerance:
+                pm, pe = dp[i-1][j-1]
+                match_m = pm + 1
+                match_e = pe - diff
+                if match_m > best_m or (match_m == best_m and match_e > best_e):
+                    best_m, best_e = match_m, match_e
+                    action = 1
+                    
+            dp[i][j] = (best_m, best_e)
+            tb[i][j] = action
+            
+    matches = {}
+    i, j = L_P, N_P
+    while i > 0 and j > 0:
+        action = tb[i][j]
+        if action == 1:
+            matches[i-1] = j-1
+            i -= 1
+            j -= 1
+        elif action == 2:
+            i -= 1
+        elif action == 3:
+            j -= 1
+        else:
+            break
+            
+    phrase_corrections = [None] * L_P
+    
+    for i in range(L_P):
+        if i in matches:
+            j = matches[i]
+            n_idx = note_starts[j]
+            start_idx = lyric_phrases[i][0]
+            correction = note_events[n_idx].time_seconds - baseline_times[start_idx]
+            if abs(correction) <= 0.4:
+                phrase_corrections[i] = correction
+            
+    if sum(1 for c in phrase_corrections if c is not None) < 2:
+        return [global_offset + base_local_offsets[i] for i in range(M)]
+            
+    # 为未匹配的句首进行插值
+    next_known = [None] * L_P
+    last = None
+    for i in range(L_P):
+        if phrase_corrections[i] is not None:
+            last = i
+        next_known[i] = last
+        
+    prev_known = [None] * L_P
+    last = None
+    for i in range(L_P - 1, -1, -1):
+        if phrase_corrections[i] is not None:
+            last = i
+        prev_known[i] = last
+        
+    for i in range(L_P):
+        if phrase_corrections[i] is not None:
+            continue
+        left = next_known[i]
+        right = prev_known[i]
+        if left is None and right is None:
+            phrase_corrections[i] = 0.0
+        elif left is None:
+            phrase_corrections[i] = phrase_corrections[right]
+        elif right is None:
+            phrase_corrections[i] = phrase_corrections[left]
+        elif right == left:
+            phrase_corrections[i] = phrase_corrections[left]
+        else:
+            cl = phrase_corrections[left]
+            cr = phrase_corrections[right]
+            t = (i - left) / (right - left)
+            phrase_corrections[i] = cl + (cr - cl) * t
+            
+    # 平滑：限制相邻句子的 correction 突变幅度，避免整句错位链式放大
+    max_jump = 0.25
+    for i in range(1, L_P):
+        delta = phrase_corrections[i] - phrase_corrections[i - 1]
+        if delta > max_jump:
+            phrase_corrections[i] = phrase_corrections[i - 1] + max_jump
+        elif delta < -max_jump:
+            phrase_corrections[i] = phrase_corrections[i - 1] - max_jump
+            
+    phrase_offsets = [0.0] * M
+    for phrase_i, indices in enumerate(lyric_phrases):
+        corr = phrase_corrections[phrase_i]
+        for idx in indices:
+            phrase_offsets[idx] = global_offset + base_local_offsets[idx] + corr
+
+    return phrase_offsets
+
+
 def align_lyrics_to_notes(
     lyric_events: List[LyricEvent],
     note_events: List[NoteEvent],
     tolerance_ms: int = 220,
+    alignment_algorithm: str = "phrase_start",
 ) -> List[AlignmentResult]:
     tolerance_sec = tolerance_ms / 1000.0
     M = len(lyric_events)
@@ -546,19 +742,37 @@ def align_lyrics_to_notes(
     note_times = [n.time_seconds for n in note_events]
     original_lyric_times = [l.time_seconds for l in lyric_events]
 
+    # 识别歌词句首
+    lyric_is_start = [False] * M
+    for i in range(M):
+        if i == 0 or lyric_events[i].source_line != lyric_events[i-1].source_line:
+            lyric_is_start[i] = True
+
+    # 识别音符句首
+    note_is_start = [False] * N
+    for j in range(N):
+        if j == 0 or note_events[j].time_seconds - note_events[j-1].end_time_seconds > 0.25:
+            note_is_start[j] = True
+
     # 1. 全局偏移校正：计算并应用中位数偏移，消除整体时间差
     global_offset = _estimate_global_offset(original_lyric_times, note_times, max_allowed=10.0)
     # 如果偏移较小（例如小于 10ms），则忽略
     if abs(global_offset) < 0.01:
         global_offset = 0.0
         
-    # 2. 局部偏移校正：通过锚点插值补偿局部的节拍波动
-    local_offsets = _estimate_local_offsets(original_lyric_times, note_times, global_offset)
-    
-    lyric_times = [original_lyric_times[i] + global_offset + local_offsets[i] for i in range(M)]
+    if alignment_algorithm == "phrase_start":
+        # 2. 局部整句预对齐：根据句首音符和句首歌词的偏差，计算整句的偏移
+        offsets = _estimate_phrase_offsets(
+            lyric_events, note_events, global_offset, lyric_is_start, note_is_start
+        )
+        lyric_times = [original_lyric_times[i] + offsets[i] for i in range(M)]
+    else:
+        # 2. 局部偏移校正：全局平均差值逻辑，通过锚点插值补偿局部的节拍波动
+        local_offsets = _estimate_local_offsets(original_lyric_times, note_times, global_offset)
+        lyric_times = [original_lyric_times[i] + global_offset + local_offsets[i] for i in range(M)]
 
-    # 动态规划表：dp[i][j] 记录前 i 个歌词和前 j 个音符的最优匹配 (最大匹配数, 最小总时间误差即最大负误差)
-    dp = [[(0, 0.0)] * (N + 1) for _ in range(M + 1)]
+    # 动态规划表：dp[i][j] 记录前 i 个歌词和前 j 个音符的最优匹配 (最大匹配数及权重, 最小总时间误差即最大负误差)
+    dp = [[(0.0, 0.0)] * (N + 1) for _ in range(M + 1)]
     # 状态回溯表：1 = match, 2 = skip lyric, 3 = skip note
     tb = [[0] * (N + 1) for _ in range(M + 1)]
 
@@ -585,7 +799,14 @@ def align_lyrics_to_notes(
                 diff = abs(l_time - note_times[j - 1])
                 if diff <= tolerance_sec:
                     pm, pe = dp[i - 1][j - 1]
-                    match_m = pm + 1
+                    
+                    match_score = 1.0
+                    if alignment_algorithm == "phrase_start":
+                        # 如果句首字匹配句首音符，增加最高权重
+                        if lyric_is_start[i - 1] and note_is_start[j - 1] and diff <= min(0.12, tolerance_sec):
+                            match_score += 0.5
+                        
+                    match_m = pm + match_score
                     match_e = pe - diff  # 误差取负数，使得最大化等于误差最小化
                     if match_m > best_m or (match_m == best_m and match_e > best_e):
                         best_m, best_e = match_m, match_e
@@ -737,17 +958,31 @@ def align_lyrics_to_midi(
     clear_existing_lyrics: bool = True,
     fill_sustain_dash: bool = True,
     split_units: bool = False,
+    alignment_algorithm: str = "phrase_start",
+    remove_parentheses: bool = False,
+    ignore_keywords: str = "",
 ):
     midi_file = mido.MidiFile(midi_file_path)
     tempo_map = TempoMap.from_midi(midi_file)
 
-    lyric_events = parse_lyric_file(lyric_file_path, split_units=split_units)
+    kw_list = [k.strip() for k in ignore_keywords.split(",") if k.strip()]
+    lyric_events = parse_lyric_file(
+        lyric_file_path, 
+        split_units=split_units,
+        remove_parentheses=remove_parentheses,
+        ignore_keywords=kw_list
+    )
 
     if target_track is None:
         target_track = choose_target_track(midi_file)
 
     note_events = extract_note_events(midi_file, tempo_map, target_track)
-    alignments = align_lyrics_to_notes(lyric_events, note_events, tolerance_ms=tolerance_ms)
+    alignments = align_lyrics_to_notes(
+        lyric_events, 
+        note_events, 
+        tolerance_ms=tolerance_ms, 
+        alignment_algorithm=alignment_algorithm
+    )
 
     sustain_inserted = write_lyrics_to_track(
         midi_file,
@@ -808,6 +1043,9 @@ def _main():
     parser.add_argument("--keep-existing", action="store_true", help="保留原有lyrics/text，不清除")
     parser.add_argument("--no-sustain-dash", action="store_true", help="不自动填充延音符号 '-'")
     parser.add_argument("--split-units", action="store_true", help="将每行歌词拆分为字/词并分别吸附（karaoke脚本默认已拆分）")
+    parser.add_argument("--alignment-algorithm", choices=["phrase_start", "global_average"], default="phrase_start", help="对齐参照算法")
+    parser.add_argument("--remove-parentheses", action="store_true", help="过滤括号内的文本 (和声/Rap等)")
+    parser.add_argument("--ignore-keywords", default="", help="忽略包含这些关键词的整句 (逗号分隔)")
     args = parser.parse_args()
 
     target_track = None if str(args.track).lower() == "auto" else int(args.track)
@@ -820,6 +1058,9 @@ def _main():
         clear_existing_lyrics=not args.keep_existing,
         fill_sustain_dash=not args.no_sustain_dash,
         split_units=bool(args.split_units),
+        alignment_algorithm=args.alignment_algorithm,
+        remove_parentheses=args.remove_parentheses,
+        ignore_keywords=args.ignore_keywords,
     )
 
     print(f"输出文件: {report['output_midi_path']}")

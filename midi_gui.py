@@ -32,9 +32,9 @@ class AlignmentWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, midi_path, lyric_path, output_path, tol, track, clear, sustain, split):
+    def __init__(self, midi_path, lyric_path, output_path, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw):
         super().__init__()
-        self.args = (midi_path, lyric_path, output_path, tol, track, clear, sustain, split)
+        self.args = (midi_path, lyric_path, output_path, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw)
 
     def run(self):
         try:
@@ -48,7 +48,7 @@ class BatchWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def __init__(self, midi_files, lyric_files, output_dir, tol, track, clear, sustain, split):
+    def __init__(self, midi_files, lyric_files, output_dir, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw):
         super().__init__()
         self.midi_files = midi_files
         self.lyric_files = lyric_files
@@ -58,6 +58,9 @@ class BatchWorker(QThread):
         self.clear = clear
         self.sustain = sustain
         self.split = split
+        self.algorithm = algorithm
+        self.rm_paren = rm_paren
+        self.ignore_kw = ignore_kw
 
     def _extract_song_id(self, file_path):
         stem = os.path.splitext(os.path.basename(file_path))[0].strip()
@@ -105,6 +108,9 @@ class BatchWorker(QThread):
                         clear_existing_lyrics=self.clear,
                         fill_sustain_dash=self.sustain,
                         split_units=self.split,
+                        alignment_algorithm=self.algorithm,
+                        remove_parentheses=self.rm_paren,
+                        ignore_keywords=self.ignore_kw,
                     )
                     report["song_id"] = song_id
                     report["midi_file"] = midi_path
@@ -227,14 +233,19 @@ class DragLineEdit(LineEdit):
     def dropEvent(self, e):
         urls = e.mimeData().urls()
         if urls:
-            path = urls[0].toLocalFile()
-            self.setText(path)
+            paths = [url.toLocalFile() for url in urls]
+            current = self.text().strip()
+            new_text = ";".join(paths)
+            if current:
+                self.setText(current + ";" + new_text)
+            else:
+                self.setText(new_text)
 
 
 class ProcessInterface(ScrollArea):
     analysisRequested = pyqtSignal(str)
-    singleProcessRequested = pyqtSignal(str, str, str, int, object, bool, bool, bool)
-    batchProcessRequested = pyqtSignal(list, list, str, int, object, bool, bool, bool)
+    singleProcessRequested = pyqtSignal(str, str, str, int, object, bool, bool, bool, str, bool, str)
+    batchProcessRequested = pyqtSignal(list, list, str, int, object, bool, bool, bool, str, bool, str)
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -256,25 +267,41 @@ class ProcessInterface(ScrollArea):
         ioLayout.addWidget(BodyLabel("MIDI 输入路径:", self.ioCard))
         midiInLayout = QHBoxLayout()
         self.midiInDirEdit = DragLineEdit(self.ioCard)
-        self.midiInDirEdit.setPlaceholderText("拖拽或选择 MIDI 文件/文件夹...")
+        self.midiInDirEdit.setPlaceholderText("拖拽或选择 MIDI 文件/文件夹 (多路径用分号隔开)...")
         self.midiInDirEdit.textChanged.connect(self.parse_midi_path)
-        self.midiInBrowseBtn = PushButton("浏览", self.ioCard)
-        self.midiInBrowseBtn.clicked.connect(self.browse_midi_dir)
+        self.midiInFileBtn = PushButton("选文件", self.ioCard)
+        self.midiInFileBtn.clicked.connect(self.browse_midi_files)
+        self.midiInDirBtn = PushButton("选目录", self.ioCard)
+        self.midiInDirBtn.clicked.connect(self.browse_midi_folder)
         midiInLayout.addWidget(self.midiInDirEdit, 1)
-        midiInLayout.addWidget(self.midiInBrowseBtn)
+        midiInLayout.addWidget(self.midiInFileBtn)
+        midiInLayout.addWidget(self.midiInDirBtn)
         ioLayout.addLayout(midiInLayout)
+        
+        self.midiCountLabel = BodyLabel("", self.ioCard)
+        self.midiCountLabel.setStyleSheet("color: #009688; margin-bottom: 4px;")
+        self.midiCountLabel.hide()
+        ioLayout.addWidget(self.midiCountLabel)
         
         # 歌词 输入路径
         ioLayout.addWidget(BodyLabel("歌词 输入路径:", self.ioCard))
         lyricInLayout = QHBoxLayout()
         self.lyricInDirEdit = DragLineEdit(self.ioCard)
-        self.lyricInDirEdit.setPlaceholderText("拖拽或选择歌词 文件/文件夹...")
+        self.lyricInDirEdit.setPlaceholderText("拖拽或选择歌词 文件/文件夹 (多路径用分号隔开)...")
         self.lyricInDirEdit.textChanged.connect(self.parse_lyric_path)
-        self.lyricInBrowseBtn = PushButton("浏览", self.ioCard)
-        self.lyricInBrowseBtn.clicked.connect(self.browse_lyric_dir)
+        self.lyricInFileBtn = PushButton("选文件", self.ioCard)
+        self.lyricInFileBtn.clicked.connect(self.browse_lyric_files)
+        self.lyricInDirBtn = PushButton("选目录", self.ioCard)
+        self.lyricInDirBtn.clicked.connect(self.browse_lyric_folder)
         lyricInLayout.addWidget(self.lyricInDirEdit, 1)
-        lyricInLayout.addWidget(self.lyricInBrowseBtn)
+        lyricInLayout.addWidget(self.lyricInFileBtn)
+        lyricInLayout.addWidget(self.lyricInDirBtn)
         ioLayout.addLayout(lyricInLayout)
+
+        self.lyricCountLabel = BodyLabel("", self.ioCard)
+        self.lyricCountLabel.setStyleSheet("color: #009688; margin-bottom: 4px;")
+        self.lyricCountLabel.hide()
+        ioLayout.addWidget(self.lyricCountLabel)
         
         # 输出路径
         ioLayout.addWidget(BodyLabel("文件输出路径:", self.ioCard))
@@ -306,7 +333,15 @@ class ProcessInterface(ScrollArea):
         self.trackCombo = ComboBox(self.paramCard)
         self.trackCombo.addItems(["auto", "0", "1", "2", "3", "4", "5", "6", "7"])
         hLayout3.addWidget(self.trackCombo)
-        hLayout3.addStretch(2)
+        hLayout3.addStretch(1)
+
+        hLayout3.addWidget(BodyLabel("对齐参照算法:", self.paramCard))
+        self.algorithmCombo = ComboBox(self.paramCard)
+        self.algorithmCombo.addItem("逐句首字差值", userData="phrase_start")
+        self.algorithmCombo.addItem("全局平均差值", userData="global_average")
+        self.algorithmCombo.setCurrentIndex(1)  # 默认选择"全局平均差值"
+        hLayout3.addWidget(self.algorithmCombo)
+        hLayout3.addStretch(1)
         
         paramLayout.addLayout(hLayout3)
         
@@ -323,6 +358,24 @@ class ProcessInterface(ScrollArea):
         paramLayout.addWidget(self.splitCheck)
         
         self.vBoxLayout.addWidget(self.paramCard)
+
+        self.filterCard = CardWidget(self.view)
+        filterLayout = QVBoxLayout(self.filterCard)
+        filterLayout.addWidget(StrongBodyLabel("歌词文本过滤 (防止和声/Rap等误吸附)", self.filterCard))
+        
+        self.removeParenCheck = CheckBox("自动过滤括号内的文本 (如: (伴唱), 【和声】 等)", self.filterCard)
+        self.removeParenCheck.setChecked(False)
+        filterLayout.addWidget(self.removeParenCheck)
+        
+        hLayoutKw = QHBoxLayout()
+        hLayoutKw.addWidget(BodyLabel("忽略包含以下关键词的整句歌词 (逗号分隔):", self.filterCard))
+        self.ignoreKwEdit = LineEdit(self.filterCard)
+        self.ignoreKwEdit.setText("过滤,伴唱,和声,合唱,说唱")
+        self.ignoreKwEdit.setPlaceholderText("例如: 伴唱,和声,说唱,合")
+        hLayoutKw.addWidget(self.ignoreKwEdit, 1)
+        filterLayout.addLayout(hLayoutKw)
+        
+        self.vBoxLayout.addWidget(self.filterCard)
         
         runLayout = QHBoxLayout()
         self.runBtn = PrimaryPushButton("开始匹配", self.view)
@@ -355,59 +408,107 @@ class ProcessInterface(ScrollArea):
             # 自动设置输出目录为第一个 MIDI 文件所在的目录
             self.outDirEdit.setText(os.path.dirname(self.midi_files[0]))
 
-    def parse_midi_path(self, path):
-        path = path.strip()
-        if not path or not os.path.exists(path):
-            self.midi_files = []
+        if len(self.midi_files) > 0:
+            self.midiCountLabel.setText(f"已发现: {len(self.midi_files)} 个 MIDI 文件")
+            self.midiCountLabel.show()
+        else:
+            self.midiCountLabel.hide()
+            
+        if len(self.lyric_files) > 0:
+            self.lyricCountLabel.setText(f"已发现: {len(self.lyric_files)} 个 歌词文件")
+            self.lyricCountLabel.show()
+        else:
+            self.lyricCountLabel.hide()
+
+    def parse_midi_path(self, path_text):
+        self.midi_files = []
+        path_text = path_text.strip()
+        if not path_text:
             self._update_counts()
             return
             
         midi_discovered = []
-        
-        if os.path.isfile(path):
-            if path.lower().endswith(('.mid', '.midi')):
-                midi_discovered.append(path)
-        elif os.path.isdir(path):
-            for root, _, files in os.walk(path):
-                for name in files:
-                    full_path = os.path.join(root, name)
-                    if name.lower().endswith(('.mid', '.midi')):
-                        midi_discovered.append(full_path)
-                        
+        for path in path_text.split(';'):
+            path = path.strip(' "\'')
+            if not path or not os.path.exists(path):
+                continue
+                
+            if os.path.isfile(path):
+                if path.lower().endswith(('.mid', '.midi')):
+                    midi_discovered.append(path)
+            elif os.path.isdir(path):
+                for root, _, files in os.walk(path):
+                    for name in files:
+                        full_path = os.path.join(root, name)
+                        if name.lower().endswith(('.mid', '.midi')):
+                            midi_discovered.append(full_path)
+                            
         self.midi_files = self._dedupe_paths(midi_discovered)
         self._update_counts()
 
-    def parse_lyric_path(self, path):
-        path = path.strip()
-        if not path or not os.path.exists(path):
-            self.lyric_files = []
+    def parse_lyric_path(self, path_text):
+        self.lyric_files = []
+        path_text = path_text.strip()
+        if not path_text:
             self._update_counts()
             return
             
         lyric_discovered = []
-        
-        if os.path.isfile(path):
-            if path.lower().endswith(('.lrc', '.txt', '.csv')):
-                lyric_discovered.append(path)
-        elif os.path.isdir(path):
-            for root, _, files in os.walk(path):
-                for name in files:
-                    full_path = os.path.join(root, name)
-                    if name.lower().endswith(('.lrc', '.txt', '.csv')):
-                        lyric_discovered.append(full_path)
-                        
+        for path in path_text.split(';'):
+            path = path.strip(' "\'')
+            if not path or not os.path.exists(path):
+                continue
+                
+            if os.path.isfile(path):
+                if path.lower().endswith(('.lrc', '.txt', '.csv')):
+                    lyric_discovered.append(path)
+            elif os.path.isdir(path):
+                for root, _, files in os.walk(path):
+                    for name in files:
+                        full_path = os.path.join(root, name)
+                        if name.lower().endswith(('.lrc', '.txt', '.csv')):
+                            lyric_discovered.append(full_path)
+                            
         self.lyric_files = self._dedupe_paths(lyric_discovered)
         self._update_counts()
 
-    def browse_midi_dir(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择MIDI文件", "", "MIDI文件 (*.mid *.midi);;所有文件 (*.*)")
-        if path:
-            self.midiInDirEdit.setText(path)
+    def browse_midi_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择MIDI文件", "", "MIDI文件 (*.mid *.midi);;所有文件 (*.*)")
+        if paths:
+            current = self.midiInDirEdit.text().strip()
+            new_text = ";".join(paths)
+            if current:
+                self.midiInDirEdit.setText(current + ";" + new_text)
+            else:
+                self.midiInDirEdit.setText(new_text)
 
-    def browse_lyric_dir(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择歌词文件", "", "歌词文件 (*.lrc *.txt *.csv);;文本文件 (*.txt *.csv);;所有文件 (*.*)")
-        if path:
-            self.lyricInDirEdit.setText(path)
+    def browse_midi_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择MIDI文件夹")
+        if folder:
+            current = self.midiInDirEdit.text().strip()
+            if current:
+                self.midiInDirEdit.setText(current + ";" + folder)
+            else:
+                self.midiInDirEdit.setText(folder)
+
+    def browse_lyric_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择歌词文件", "", "歌词文件 (*.lrc *.txt *.csv);;文本文件 (*.txt *.csv);;所有文件 (*.*)")
+        if paths:
+            current = self.lyricInDirEdit.text().strip()
+            new_text = ";".join(paths)
+            if current:
+                self.lyricInDirEdit.setText(current + ";" + new_text)
+            else:
+                self.lyricInDirEdit.setText(new_text)
+
+    def browse_lyric_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择歌词文件夹")
+        if folder:
+            current = self.lyricInDirEdit.text().strip()
+            if current:
+                self.lyricInDirEdit.setText(current + ";" + folder)
+            else:
+                self.lyricInDirEdit.setText(folder)
 
     def browse_out_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "选择输出目录")
@@ -430,6 +531,9 @@ class ProcessInterface(ScrollArea):
         clear = self.clearCheck.isChecked()
         sustain = self.sustainCheck.isChecked()
         split = self.splitCheck.isChecked()
+        algorithm = self.algorithmCombo.currentData()
+        rm_paren = self.removeParenCheck.isChecked()
+        ignore_kw = self.ignoreKwEdit.text().strip()
         
         os.makedirs(out_dir, exist_ok=True)
         
@@ -439,9 +543,9 @@ class ProcessInterface(ScrollArea):
             lyric_path = self.lyric_files[0]
             midi_name, midi_ext = os.path.splitext(os.path.basename(midi_path))
             output_path = os.path.join(out_dir, f"{midi_name}_with_lyrics{midi_ext or '.mid'}")
-            self.singleProcessRequested.emit(midi_path, lyric_path, output_path, tol, track, clear, sustain, split)
+            self.singleProcessRequested.emit(midi_path, lyric_path, output_path, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw)
         else:
-            self.batchProcessRequested.emit(self.midi_files, self.lyric_files, out_dir, tol, track, clear, sustain, split)
+            self.batchProcessRequested.emit(self.midi_files, self.lyric_files, out_dir, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw)
 
 
 class MidiAnalysisInterface(ScrollArea):
@@ -549,10 +653,13 @@ class MidiAnalysisInterface(ScrollArea):
             self.table.setItem(row, 5, QTableWidgetItem(item['details']))
 
 
+from lyric_calibrator_gui import LyricCalibratorWidget
+
+
 class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MIDI 歌词匹配工具")
+        self.setWindowTitle("MIDI & 歌词处理工具箱")
         
         # 设置窗口图标
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -561,18 +668,32 @@ class MainWindow(FluentWindow):
             
         self.resize(1100, 750)
         
+        # 居中
+        desktop = QApplication.primaryScreen().availableGeometry()
+        w, h = desktop.width(), desktop.height()
+        self.move(w//2 - self.width()//2, h//2 - self.height()//2)
+        
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
         plt.rcParams['axes.unicode_minus'] = False
         
+        # 1. 对齐吸附界面
         self.processInterface = ProcessInterface(self)
+        self.processInterface.setObjectName("ProcessInterface")
+        self.addSubInterface(self.processInterface, FluentIcon.DOCUMENT, "MIDI 歌词吸附对齐")
+        
+        # 2. 歌词时间轴校准界面
+        self.calibratorInterface = LyricCalibratorWidget(self)
+        self.calibratorInterface.setObjectName("CalibratorInterface")
+        self.addSubInterface(self.calibratorInterface, FluentIcon.EDIT, "歌词时间轴打点校准")
+        
+        # 3. 分析结果界面
         self.analysisInterface = MidiAnalysisInterface(self)
+        self.analysisInterface.setObjectName("AnalysisInterface")
+        self.addSubInterface(self.analysisInterface, FluentIcon.PIE_SINGLE, "MIDI 分析")
         
         self.processInterface.singleProcessRequested.connect(self.start_alignment)
         self.processInterface.batchProcessRequested.connect(self.start_batch)
         self.analysisInterface.analysisRequested.connect(self.start_analysis)
-        
-        self.addSubInterface(self.processInterface, FluentIcon.DOCUMENT, '文件处理')
-        self.addSubInterface(self.analysisInterface, FluentIcon.PIE_SINGLE, 'MIDI 分析')
 
     def start_analysis(self, path):
         self.analyze_worker = AnalyzeWorker(path)
@@ -585,8 +706,8 @@ class MainWindow(FluentWindow):
         self.analysisInterface.update_results(notes, lyrics, text_events)
         InfoBar.success("分析完成", "MIDI 文件分析完毕", parent=self)
 
-    def start_alignment(self, midi, lyric, out, tol, track, clear, sustain, split):
-        self.align_worker = AlignmentWorker(midi, lyric, out, tol, track, clear, sustain, split)
+    def start_alignment(self, midi, lyric, out, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw):
+        self.align_worker = AlignmentWorker(midi, lyric, out, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw)
         self.align_worker.finished.connect(self.on_align_finished)
         self.align_worker.error.connect(self.on_error)
         self.align_worker.start()
@@ -608,8 +729,8 @@ class MainWindow(FluentWindow):
             
         MessageBox("对齐完成", summary, self).exec()
 
-    def start_batch(self, midis, lyrics, out_dir, tol, track, clear, sustain, split):
-        self.batch_worker = BatchWorker(midis, lyrics, out_dir, tol, track, clear, sustain, split)
+    def start_batch(self, midis, lyrics, out_dir, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw):
+        self.batch_worker = BatchWorker(midis, lyrics, out_dir, tol, track, clear, sustain, split, algorithm, rm_paren, ignore_kw)
         self.batch_worker.finished.connect(self.on_batch_finished)
         self.batch_worker.error.connect(self.on_error)
         self.batch_worker.start()
