@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 from qfluentwidgets import (
     PushButton, PrimaryPushButton, LineEdit, 
     CardWidget, InfoBar, BodyLabel, TitleLabel, SubtitleLabel, MessageBoxBase,
-    FluentIcon as FIF, Slider, CheckBox, TransparentToolButton, ComboBox
+    FluentIcon as FIF, Slider, CheckBox, TransparentToolButton, ComboBox, SpinBox
 )
 
 from midi_lyric_aligner import parse_lyric_file, LyricEvent, parse_time_to_seconds
@@ -1375,10 +1375,6 @@ class LyricCalibratorWidget(QWidget):
         title = TitleLabel("歌词时间轴校准", self)
         main_layout.addWidget(title)
         
-        subtitle = BodyLabel("拖拽文件载入 -> 按住 Ctrl+滚轮 丝滑缩放 -> 拖拽橙色标记微调 -> 目标位置双击瞬间吸附歌词。", self)
-        subtitle.setTextColor(QColor(100, 100, 100), QColor(150, 150, 150))
-        main_layout.addWidget(subtitle)
-        
         # --- 文件选择区 ---
         file_card = CardWidget(self)
         file_layout = QVBoxLayout(file_card)
@@ -1555,6 +1551,14 @@ class LyricCalibratorWidget(QWidget):
         
         # --- 底部保存区 ---
         bottom_layout = QHBoxLayout()
+        bottom_layout.addWidget(BodyLabel("并句阈值(ms):", self))
+        self.merge_threshold_spin = SpinBox(self)
+        self.merge_threshold_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.merge_threshold_spin.setRange(50, 1500)
+        self.merge_threshold_spin.setValue(350)
+        self.merge_threshold_spin.setSingleStep(50)
+        self.merge_threshold_spin.setToolTip("新插入歌词并入最近句的最大时间距离")
+        bottom_layout.addWidget(self.merge_threshold_spin)
         bottom_layout.addStretch(1)
         
         bottom_layout.addWidget(BodyLabel("导出格式:", self))
@@ -1846,6 +1850,136 @@ class LyricCalibratorWidget(QWidget):
     def place_filter_end(self):
         self.timeline_widget.set_filter_end(self.smooth_play_time)
 
+    def _merge_inserted_events_generic(self, events, threshold_sec: float = 0.35):
+        """
+        通用归并（非 KSC 细粒度时长场景）：
+        - 新插入锚点按时间归并到所在句/最近句（阈值内）
+        - 距离过远则保留为独立新句
+        """
+        import bisect
+        import re
+
+        if not events:
+            return []
+
+        base_rows = {}
+        extras = []
+        for ev in events:
+            if isinstance(ev.source_line, int) and ev.source_line > 0:
+                if ev.source_line not in base_rows:
+                    base_rows[ev.source_line] = ev
+            else:
+                extras.append(ev)
+
+        # 无原始句子，直接按时间返回
+        if not base_rows:
+            out = clone_lyrics(events)
+            out.sort(key=lambda x: x.time_seconds)
+            return out
+
+        rows = sorted(base_rows.values(), key=lambda x: x.time_seconds)
+        row_meta = []
+        for i, row_ev in enumerate(rows):
+            start = row_ev.time_seconds
+            if i + 1 < len(rows):
+                end = rows[i + 1].time_seconds
+            else:
+                end = start + 2.0
+            row_meta.append({
+                "ev": row_ev,
+                "start": start,
+                "end": end,
+                "inserts": [],
+            })
+
+        # 分配插入点
+        for ex in sorted(extras, key=lambda x: x.time_seconds):
+            if not ex.text:
+                continue
+            best = None
+            best_dist = float("inf")
+            for row in row_meta:
+                if row["start"] <= ex.time_seconds <= row["end"]:
+                    best = row
+                    best_dist = 0.0
+                    break
+                if ex.time_seconds < row["start"]:
+                    dist = row["start"] - ex.time_seconds
+                else:
+                    dist = ex.time_seconds - row["end"]
+                if dist < best_dist:
+                    best = row
+                    best_dist = dist
+            if best is not None and best_dist <= threshold_sec:
+                best["inserts"].append(ex)
+
+        def split_units(text: str):
+            if " " in text.strip():
+                return [u for u in text.split(" ") if u != ""], "space"
+            return list(text), "char"
+
+        def is_ascii_word(token: str) -> bool:
+            return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-']*", token.strip()))
+
+        def render_units(units, style: str):
+            if style == "space":
+                return " ".join(units)
+            # 非空格模式下，保证英文单词之间有空格，其他字符保持原有连写习惯
+            out = []
+            prev_word = False
+            for u in units:
+                token = u.strip()
+                if not token:
+                    continue
+                curr_word = is_ascii_word(token)
+                if out and prev_word and curr_word:
+                    out.append(" ")
+                out.append(token)
+                prev_word = curr_word
+            return "".join(out)
+
+        # 复制基础事件并执行归并文本
+        merged_base = []
+        for row in row_meta:
+            ev = row["ev"]
+            inserts = sorted(row["inserts"], key=lambda x: x.time_seconds)
+            merged_ev = LyricEvent(time_seconds=ev.time_seconds, text=ev.text, source_line=ev.source_line)
+            if inserts:
+                units, style = split_units(ev.text)
+                n = len(units)
+                start = row["start"]
+                end = row["end"]
+                span = max(0.001, end - start)
+                token_starts = [start + i * (span / max(1, n)) for i in range(n)]
+
+                slot_map = {}
+                for ins in inserts:
+                    slot = bisect.bisect_left(token_starts, ins.time_seconds) if token_starts else 0
+                    slot_map.setdefault(slot, []).append(ins.text)
+
+                new_units = []
+                for slot in range(n + 1):
+                    for t in slot_map.get(slot, []):
+                        new_units.append(t)
+                    if slot < n:
+                        new_units.append(units[slot])
+                merged_ev.text = render_units(new_units, style)
+            merged_base.append(merged_ev)
+
+        # 保留远距插入点为独立新句
+        merged_ids = set()
+        for row in row_meta:
+            for ins in row["inserts"]:
+                merged_ids.add(id(ins))
+        standalone = []
+        for ex in extras:
+            if id(ex) not in merged_ids and ex.text:
+                standalone.append(LyricEvent(time_seconds=ex.time_seconds, text=ex.text, source_line=-1))
+
+        out = merged_base + standalone
+        out.sort(key=lambda x: x.time_seconds)
+        return out
+
     def insert_lyric_anchor(self):
         """在播放头位置插入一个空白歌词锚点"""
         tw = self.timeline_widget
@@ -1935,6 +2069,9 @@ class LyricCalibratorWidget(QWidget):
         try:
             # 按时间排序以防拖拽导致乱序
             updated_events.sort(key=lambda x: x.time_seconds)
+            # 通用归并（全格式）：将新插入锚点并入分句；远距保留独立句
+            merge_threshold_sec = self.merge_threshold_spin.value() / 1000.0
+            merged_events = self._merge_inserted_events_generic(updated_events, threshold_sec=merge_threshold_sec)
             
             # 源格式 (智能判断当前 ext) 或明确选择了格式
             target_ext = os.path.splitext(out_path)[1].lower()
@@ -1942,25 +2079,28 @@ class LyricCalibratorWidget(QWidget):
             # 当选择源格式，或者目标后缀匹配原后缀时，采用智能替换模式
             # 注意：传入源文件扩展名 ext.lower()，以正确解析原始格式并替换时间戳
             if format_idx == 0 or target_ext == ext.lower():
-                self._save_as_source_format(self.lyric_path, out_path, updated_events, ext.lower())
+                # 源格式保存交由 _save_as_source_format 内部分流：
+                # - KSC: 使用原始插入事件做句内归并+毫秒数组重写
+                # - 非 KSC: 走通用归并
+                self._save_as_source_format(self.lyric_path, out_path, updated_events, ext.lower(), merge_threshold_sec)
                 InfoBar.success("保存成功", f"已成功导出到:\n{out_path}", parent=self)
                 return
                 
             with open(out_path, "w", encoding="utf-8-sig") as f:
                 if target_ext == ".lrc":
-                    for ev in updated_events:
+                    for ev in merged_events:
                         minutes = int(ev.time_seconds // 60)
                         seconds = ev.time_seconds % 60
                         f.write(f"[{minutes:02d}:{seconds:05.2f}]{ev.text}\n")
                         
                 elif target_ext == ".ksc":
                     f.write("karaoke.add('00:00.000', '00:00.000', '*', '');\n")
-                    for i, ev in enumerate(updated_events):
+                    for i, ev in enumerate(merged_events):
                         minutes = int(ev.time_seconds // 60)
                         seconds = ev.time_seconds % 60
                         time_str = f"{minutes:02d}:{seconds:06.3f}"
                         # 简单估算结束时间为下一个词的开始，或当前+2秒
-                        end_time_sec = updated_events[i+1].time_seconds if i+1 < len(updated_events) else ev.time_seconds + 2.0
+                        end_time_sec = merged_events[i+1].time_seconds if i+1 < len(merged_events) else ev.time_seconds + 2.0
                         e_min = int(end_time_sec // 60)
                         e_sec = end_time_sec % 60
                         end_str = f"{e_min:02d}:{e_sec:06.3f}"
@@ -1968,20 +2108,21 @@ class LyricCalibratorWidget(QWidget):
                         
                 elif target_ext == ".csv":
                     f.write("Start Time,End Time,Text\n")
-                    for i, ev in enumerate(updated_events):
-                        end_time_sec = updated_events[i+1].time_seconds if i+1 < len(updated_events) else ev.time_seconds + 2.0
+                    for i, ev in enumerate(merged_events):
+                        end_time_sec = merged_events[i+1].time_seconds if i+1 < len(merged_events) else ev.time_seconds + 2.0
                         f.write(f"{ev.time_seconds:.3f},{end_time_sec:.3f},{ev.text}\n")
                         
                 else: # 默认 txt 或其他格式
-                    for ev in updated_events:
+                    for ev in merged_events:
                         f.write(f"{ev.time_seconds:.3f}\t{ev.text}\n")
                     
             InfoBar.success("保存成功", f"已成功导出到:\n{out_path}", parent=self)
         except Exception as e:
             InfoBar.error("保存失败", str(e), parent=self)
 
-    def _save_as_source_format(self, in_path, out_path, updated_events, ext):
+    def _save_as_source_format(self, in_path, out_path, updated_events, ext, merge_threshold_sec: float = 0.35):
         import re
+        import bisect
         with open(in_path, "r", encoding="utf-8-sig") as f:
             lines = f.readlines()
         
@@ -1992,7 +2133,109 @@ class LyricCalibratorWidget(QWidget):
             detected_format = ".ksc"
         elif re.search(r"\[\d+:\d+[.,]\d+\]", content_sample):
             detected_format = ".lrc"
+
+        # 非 KSC 源格式：先做通用并句归并
+        if detected_format != ".ksc":
+            updated_events = self._merge_inserted_events_generic(
+                updated_events,
+                threshold_sec=max(0.01, float(merge_threshold_sec))
+            )
             
+        def parse_ksc_line(raw_line: str):
+            m = re.search(
+                r"^\s*karaoke\.add\(\s*['\"](?P<start>.*?)['\"]\s*,\s*['\"](?P<end>.*?)['\"]\s*,\s*['\"](?P<text>.*?)['\"]\s*,\s*['\"](?P<dur>.*?)['\"]\s*\)\s*;?",
+                raw_line.strip(),
+                re.IGNORECASE
+            )
+            if not m:
+                return None
+            return {
+                "start": m.group("start"),
+                "end": m.group("end"),
+                "text": m.group("text"),
+                "dur": m.group("dur"),
+            }
+
+        def detect_ksc_non_english_bracket_style(all_lines):
+            """
+            检测源 KSC 是否对非英文单元使用中括号。
+            规则：
+            - 若发现 [中/日/韩等] 这样的 bracket 单元，则认为启用非英文 bracket 风格；
+            - 否则仅英文单词使用 bracket。
+            """
+            for raw in all_lines:
+                parsed = parse_ksc_line(raw)
+                if not parsed:
+                    continue
+                for token in re.findall(r"\[([^\]]*)\]", parsed["text"]):
+                    base = token.strip()
+                    if base and not is_ascii_word(base):
+                        return True
+            return False
+
+        def parse_units(text_param: str):
+            bracket_units = re.findall(r"\[([^\]]*)\]", text_param)
+            if bracket_units:
+                return bracket_units, "bracket"
+            if " " in text_param.strip():
+                return [u for u in text_param.split(" ") if u != ""], "space"
+            return list(text_param), "plain"
+
+        def is_ascii_word(token: str) -> bool:
+            return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-']*", token.strip()))
+
+        ksc_non_english_use_brackets = detect_ksc_non_english_bracket_style(lines) if detected_format == ".ksc" else False
+
+        def normalize_ksc_unit(unit_text: str, is_last: bool):
+            """
+            KSC 单元格式：
+            - 英文单词在句首/句中：末尾带空格（如 TEST -> 'TEST '）
+            - 英文单词在句尾或单独成句：不带空格（如 TEST）
+            """
+            u = unit_text if unit_text is not None else ""
+            base = u.strip()
+            if is_ascii_word(base):
+                return base if is_last else (base + " ")
+            return u
+
+        def render_units(units, style: str):
+            out = []
+            total = len(units)
+            for idx, u in enumerate(units):
+                raw = u if u is not None else ""
+                token = raw.strip()
+                if not token:
+                    continue
+                if is_ascii_word(token):
+                    out.append(f"[{normalize_ksc_unit(token, is_last=(idx == total - 1))}]")
+                else:
+                    if ksc_non_english_use_brackets:
+                        out.append(f"[{token}]")
+                    else:
+                        out.append(token)
+            return "".join(out)
+
+        def parse_duration_list(dur_param: str):
+            vals = []
+            for s in dur_param.split(","):
+                s = s.strip()
+                if s.isdigit():
+                    vals.append(int(s))
+            return vals
+
+        def fmt_mmssmmm(sec: float):
+            m = int(sec // 60)
+            s = sec % 60
+            return f"{m:02d}:{s:06.3f}"
+
+        def rebuild_ksc_line(raw_line: str, start_sec: float, end_sec: float, text_param: str, durations):
+            line_prefix = re.match(r"^(\s*)", raw_line).group(1) if raw_line else ""
+            dur_text = ",".join(str(int(max(1, d))) for d in durations)
+            return (
+                f"{line_prefix}karaoke.add('{fmt_mmssmmm(start_sec)}', '{fmt_mmssmmm(end_sec)}', "
+                f"'{text_param}', '{dur_text}');\n"
+            )
+
         # 根据 source_line 进行精准替换
         event_dict = {}
         extra_events = []
@@ -2005,9 +2248,211 @@ class LyricCalibratorWidget(QWidget):
             else:
                 # 新插入锚点等无原始行号的事件，追加写入
                 extra_events.append(ev)
+
+        # --- KSC：将新增锚点按时间归并到最近句/所在句 ---
+        ksc_line_overrides = {}
+        standalone_ksc_events = []
+        if detected_format == ".ksc" and extra_events:
+            MERGE_NEAR_THRESHOLD_SEC = max(0.01, float(merge_threshold_sec))
+            DEFAULT_INSERT_DUR_MS = 150
+            MIN_DUR_MS = 40
+
+            row_meta = []
+            for line_no, ev_list in event_dict.items():
+                if not ev_list:
+                    continue
+                if line_no <= 0 or line_no > len(lines):
+                    continue
+                parsed = parse_ksc_line(lines[line_no - 1])
+                if not parsed:
+                    continue
+
+                ev = ev_list[0]
+                units, unit_style = parse_units(parsed["text"])
+                orig_durs = parse_duration_list(parsed["dur"])
+                if not orig_durs:
+                    orig_durs = [DEFAULT_INSERT_DUR_MS] * max(1, len(units))
+                if len(units) == 0:
+                    units = ["" for _ in orig_durs]
+                elif len(units) < len(orig_durs):
+                    units.extend([""] * (len(orig_durs) - len(units)))
+                elif len(units) > len(orig_durs):
+                    orig_durs.extend([DEFAULT_INSERT_DUR_MS] * (len(units) - len(orig_durs)))
+
+                start_sec = ev.time_seconds
+                end_sec = start_sec + sum(orig_durs) / 1000.0
+                token_starts = []
+                cur = start_sec
+                for d in orig_durs:
+                    token_starts.append(cur)
+                    cur += d / 1000.0
+
+                row_meta.append({
+                    "line_no": line_no,
+                    "start_sec": start_sec,
+                    "end_sec": end_sec,
+                    "units": units,
+                    "style": unit_style,
+                    "orig_durs": orig_durs,
+                    "token_starts": token_starts,
+                    "inserts": [],
+                })
+
+            # 分配新增锚点到句子：优先落在句区间内，否则按最近距离+阈值
+            for ex in sorted(extra_events, key=lambda x: x.time_seconds):
+                if not ex.text:
+                    continue
+                best_row = None
+                best_dist = float("inf")
+                for row in row_meta:
+                    if row["start_sec"] <= ex.time_seconds <= row["end_sec"]:
+                        best_row = row
+                        best_dist = 0.0
+                        break
+                    if ex.time_seconds < row["start_sec"]:
+                        dist = row["start_sec"] - ex.time_seconds
+                    else:
+                        dist = ex.time_seconds - row["end_sec"]
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_row = row
+
+                if best_row is not None and best_dist <= MERGE_NEAR_THRESHOLD_SEC:
+                    best_row["inserts"].append(ex)
+                else:
+                    standalone_ksc_events.append(ex)
+
+            # 对每个句子执行归并并重写 text / durations / end
+            for row in row_meta:
+                inserts = sorted(row["inserts"], key=lambda x: x.time_seconds)
+                if not inserts:
+                    continue
+
+                orig_units = list(row["units"])
+                orig_durs = list(row["orig_durs"])
+                token_starts = list(row["token_starts"])
+
+                # 先为每个插入点分配时长（优先用相邻插入点时间差）
+                insert_infos = []
+                for i, ins in enumerate(inserts):
+                    if i + 1 < len(inserts):
+                        gap_ms = int(round((inserts[i + 1].time_seconds - ins.time_seconds) * 1000))
+                        dur_ms = max(MIN_DUR_MS, gap_ms)
+                    else:
+                        dur_ms = DEFAULT_INSERT_DUR_MS
+                    insert_infos.append((ins, dur_ms))
+
+                # 将插入按“原 token 起始时间”的插槽归类（保持原有 token 时长不变）
+                slot_map = {}
+                for ins, dur_ms in insert_infos:
+                    slot = bisect.bisect_left(token_starts, ins.time_seconds)
+                    slot_map.setdefault(slot, []).append((ins.time_seconds, ins.text, dur_ms))
+                for slot in slot_map:
+                    slot_map[slot].sort(key=lambda x: x[0])
+
+                new_units = []
+                new_durs = []
+                for slot in range(len(orig_units) + 1):
+                    for _t, txt, dur_ms in slot_map.get(slot, []):
+                        new_units.append(txt)
+                        new_durs.append(max(MIN_DUR_MS, int(dur_ms)))
+                    if slot < len(orig_units):
+                        new_units.append(orig_units[slot])
+                        new_durs.append(max(MIN_DUR_MS, int(orig_durs[slot])))
+
+                new_end_sec = row["start_sec"] + sum(new_durs) / 1000.0
+                new_text_param = render_units(new_units, row["style"])
+
+                ksc_line_overrides[row["line_no"]] = {
+                    "start_sec": row["start_sec"],
+                    "end_sec": new_end_sec,
+                    "text_param": new_text_param,
+                    "durations": new_durs,
+                }
             
+        if detected_format == ".ksc":
+            append_events = sorted([e for e in standalone_ksc_events if e.text], key=lambda x: x.time_seconds)
+        else:
+            append_events = sorted([e for e in extra_events if e.text], key=lambda x: x.time_seconds)
+
+        def parse_line_time(raw_line: str):
+            if detected_format == ".ksc":
+                parsed = parse_ksc_line(raw_line)
+                if parsed:
+                    try:
+                        return parse_time_to_seconds(parsed["start"])
+                    except Exception:
+                        return None
+                return None
+            if detected_format == ".lrc":
+                m = re.search(r"\[(\d+:\d+(?:[.,]\d+)?)\]", raw_line)
+                if m:
+                    try:
+                        return parse_time_to_seconds(m.group(1).replace(",", "."))
+                    except Exception:
+                        return None
+                return None
+            if detected_format == ".csv":
+                head = raw_line.strip().split(",")[0] if raw_line.strip() else ""
+                try:
+                    return parse_time_to_seconds(head)
+                except Exception:
+                    return None
+            m = re.match(r"^\s*((?:\d+:)?\d+[:.]\d+)", raw_line)
+            if m:
+                try:
+                    return parse_time_to_seconds(m.group(1).replace(",", "."))
+                except Exception:
+                    return None
+            return None
+
+        def write_insert_event(file_obj, ev, upper_bound_sec=None, next_insert_sec=None):
+            minutes = int(ev.time_seconds // 60)
+            seconds = ev.time_seconds % 60
+            if detected_format == ".lrc":
+                file_obj.write(f"[{minutes:02d}:{seconds:05.2f}]{ev.text}\n")
+            elif detected_format == ".ksc":
+                end_time_sec = ev.time_seconds + 0.5
+                if next_insert_sec is not None:
+                    end_time_sec = min(end_time_sec, next_insert_sec)
+                if upper_bound_sec is not None:
+                    end_time_sec = min(end_time_sec, upper_bound_sec)
+                e_min = int(end_time_sec // 60)
+                e_sec = end_time_sec % 60
+                token_raw = (ev.text or "").strip()
+                if is_ascii_word(token_raw):
+                    text_param = f"[{normalize_ksc_unit(token_raw, is_last=True)}]"
+                else:
+                    text_param = f"[{token_raw}]" if ksc_non_english_use_brackets else token_raw
+                file_obj.write(
+                    f"karaoke.add('{minutes:02d}:{seconds:06.3f}', "
+                    f"'{e_min:02d}:{e_sec:06.3f}', '{text_param}', '500');\n"
+                )
+            else:
+                file_obj.write(f"{ev.time_seconds:.3f}\t{ev.text}\n")
+
+        insert_ptr = 0
+
         with open(out_path, "w", encoding="utf-8-sig") as f:
             for i, line in enumerate(lines, start=1):
+                # 当前行时间（用于把独立新句插入到正确行位置）
+                if i in event_dict and event_dict[i]:
+                    current_line_time = event_dict[i][0].time_seconds
+                else:
+                    current_line_time = parse_line_time(line)
+
+                # 在写当前行前，先写入所有时间更早的独立新句
+                if current_line_time is not None:
+                    while insert_ptr < len(append_events) and append_events[insert_ptr].time_seconds < current_line_time:
+                        next_insert_sec = append_events[insert_ptr + 1].time_seconds if insert_ptr + 1 < len(append_events) else None
+                        write_insert_event(
+                            f,
+                            append_events[insert_ptr],
+                            upper_bound_sec=current_line_time,
+                            next_insert_sec=next_insert_sec
+                        )
+                        insert_ptr += 1
+
                 if i not in event_dict:
                     f.write(line)
                     continue
@@ -2022,31 +2467,32 @@ class LyricCalibratorWidget(QWidget):
                 expected_text = ev.text
                 has_filter_marker = expected_text.startswith("（过滤）") or expected_text.startswith("(过滤)")
                 
-                # LRC 格式行内替换
+                # LRC 格式行内替换（时间+文本）
                 if detected_format == ".lrc":
-                    # 替换类似于 [01:23.45] 的标签
-                    new_line = re.sub(r"\[\d+:\d+(?:[.,]\d+)?\]", f"[{minutes:02d}:{seconds:05.2f}]", current_line, count=1)
+                    f.write(f"[{minutes:02d}:{seconds:05.2f}]{ev.text}\n")
                     
-                    # 处理文本部分的（过滤）标记
-                    if has_filter_marker:
-                        # 找到标签结束后，检查是否已经有过滤标记
-                        # 先截取标签部分后的文本
-                        tag_end_pos = new_line.find("]") + 1
-                        if tag_end_pos > 0:
-                            original_text_after_tag = new_line[tag_end_pos:].strip()
-                            # 移除旧有的过滤标记（如果存在）
-                            cleaned_text = original_text_after_tag.replace("（过滤）", "").replace("(过滤)", "")
-                            # 加上新的过滤标记（只在文本前面加）
-                            marked_text = "（过滤）" + cleaned_text
-                            # 重新拼接
-                            new_line = new_line[:tag_end_pos] + marked_text + "\n"
-                    else:
-                        # 移除过滤标记（如果有）
-                        new_line = new_line.replace("（过滤）", "").replace("(过滤)", "")
-                    f.write(new_line)
+                # CSV 格式（时间+文本）
+                elif detected_format == ".csv":
+                    end_time_sec = ev.time_seconds + 2.0
+                    if i + 1 in event_dict:
+                        end_time_sec = event_dict[i+1][0].time_seconds
+                    f.write(f"{ev.time_seconds:.3f},{end_time_sec:.3f},{ev.text}\n")
                     
                 # KSC/小灰熊格式替换
                 elif detected_format == ".ksc":
+                    # 若该行有归并结果，直接重写整句（起始、结束、文本、毫秒数组）
+                    if i in ksc_line_overrides:
+                        ov = ksc_line_overrides[i]
+                        new_line = rebuild_ksc_line(
+                            current_line,
+                            ov["start_sec"],
+                            ov["end_sec"],
+                            ov["text_param"],
+                            ov["durations"]
+                        )
+                        f.write(new_line)
+                        continue
+
                     # 从原始行提取第四个参数（每个字的毫秒数），用于计算正确的结束时间
                     # 格式: karaoke.add('起始时间', '结束时间', '[字1][字2]...', '毫秒1,毫秒2,...');
                     duration_match = re.search(r"karaoke\.add\s*\([^,]+,[^,]+,[^,]+,\s*['\"]([^'\"]+)['\"]", current_line, re.IGNORECASE)
@@ -2082,40 +2528,11 @@ class LyricCalibratorWidget(QWidget):
                     f.write(new_line)
                     
                 else:
-                    # 普通文本格式处理（txt/csv 等）
-                    # 替换行首的时间戳，支持格式：5.123, 0:05.12, 00:05.123 等
-                    # 匹配：可选的 分:秒.毫秒 或 秒.毫秒
-                    time_pattern = r"^(\s*)(?:\d+:)?\d+[:.]\d+"
-                    new_time_str = f"{ev.time_seconds:.3f}"
-                    new_line = re.sub(time_pattern, rf"\g<1>{new_time_str}", current_line, count=1)
-                    
-                    # 处理过滤标记
-                    cleaned_line = new_line.replace("（过滤）", "").replace("(过滤)", "")
-                    if has_filter_marker:
-                        f.write("（过滤）" + cleaned_line)
-                    else:
-                        f.write(cleaned_line)
+                    # 普通文本：统一写为 时间 + 文本
+                    f.write(f"{ev.time_seconds:.3f}\t{ev.text}\n")
 
-            # 追加写入新插入的歌词锚点（无 source_line）
-            if extra_events:
-                f.write("\n")
-                extra_events.sort(key=lambda x: x.time_seconds)
-                for idx, ev in enumerate(extra_events):
-                    if not ev.text:
-                        continue
-                    minutes = int(ev.time_seconds // 60)
-                    seconds = ev.time_seconds % 60
-                    if detected_format == ".lrc":
-                        f.write(f"[{minutes:02d}:{seconds:05.2f}]{ev.text}\n")
-                    elif detected_format == ".ksc":
-                        end_time_sec = ev.time_seconds + 0.5
-                        if idx + 1 < len(extra_events):
-                            end_time_sec = min(end_time_sec, extra_events[idx + 1].time_seconds)
-                        e_min = int(end_time_sec // 60)
-                        e_sec = end_time_sec % 60
-                        f.write(
-                            f"karaoke.add('{minutes:02d}:{seconds:06.3f}', "
-                            f"'{e_min:02d}:{e_sec:06.3f}', '[{ev.text}]', '500');\n"
-                        )
-                    else:
-                        f.write(f"{ev.time_seconds:.3f}\t{ev.text}\n")
+            # 写入剩余独立新句（时间在最后一行之后）
+            while insert_ptr < len(append_events):
+                next_insert_sec = append_events[insert_ptr + 1].time_seconds if insert_ptr + 1 < len(append_events) else None
+                write_insert_event(f, append_events[insert_ptr], upper_bound_sec=None, next_insert_sec=next_insert_sec)
+                insert_ptr += 1
