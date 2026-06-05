@@ -16,7 +16,7 @@ from PyQt6.QtGui import (
     QIcon, QPixmap, QTransform,
 )
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QScrollArea, QDialog, QFormLayout
+    QWidget, QVBoxLayout, QHBoxLayout, QFileDialog, QScrollArea, QDialog, QFormLayout, QInputDialog
 )
 
 from qfluentwidgets import (
@@ -857,6 +857,67 @@ class AudioTimelineWidget(QWidget):
                 min_dist = dist
                 closest_idx = i
         return closest_idx
+
+    def _get_lyric_label_rect(self, idx):
+        """计算歌词文本块矩形，用于双击编辑命中测试"""
+        if idx < 0 or idx >= len(self.lyrics):
+            return QRectF()
+        ev = self.lyrics[idx]
+        lx = ev.time_seconds * self.zoom
+        y_offset = 26 + 5 + (idx % 5) * 28
+        display_text = ev.text if ev.text else " "
+        fm = self.fontMetrics()
+        tw = fm.horizontalAdvance(display_text)
+        th = fm.height()
+        return QRectF(lx + 4, y_offset, tw + 12, th + 8)
+
+    def _get_hit_lyric_label(self, x_pos, y_pos):
+        """命中文本块（而不是竖线）"""
+        for i, _ev in enumerate(self.lyrics):
+            if self._get_lyric_label_rect(i).contains(x_pos, y_pos):
+                return i
+        return -1
+
+    def _contains_cjk_char(self, text: str) -> bool:
+        """是否包含 CJK/日文/韩文字符"""
+        for ch in text:
+            code = ord(ch)
+            if (
+                0x3400 <= code <= 0x4DBF or   # CJK 扩展 A
+                0x4E00 <= code <= 0x9FFF or   # CJK 基本区
+                0xF900 <= code <= 0xFAFF or   # CJK 兼容汉字
+                0x3040 <= code <= 0x309F or   # 平假名
+                0x30A0 <= code <= 0x30FF or   # 片假名
+                0xAC00 <= code <= 0xD7AF      # 韩文
+            ):
+                return True
+        return False
+
+    def _edit_lyric_text(self, idx):
+        if idx < 0 or idx >= len(self.lyrics):
+            return
+        old_state = (clone_lyrics(self.lyrics), clone_anchors(self.filter_anchors))
+        old_text = self.lyrics[idx].text
+        text, ok = QInputDialog.getText(self, "编辑歌词锚点", "请输入一个字符或一个单词：", text=old_text)
+        if not ok:
+            return
+
+        new_text = text.strip()
+        # 限制：仅允许一个字符或一个单词（无空白分隔）
+        if not new_text:
+            self.lyrics[idx].text = ""
+        elif any(ch.isspace() for ch in new_text):
+            InfoBar.warning("输入无效", "仅允许输入一个字或一个单词（不能包含空格）", parent=self.window())
+            return
+        elif self._contains_cjk_char(new_text) and len(new_text) != 1:
+            InfoBar.warning("输入无效", "包含中文/日文/韩文时，仅允许输入 1 个字符", parent=self.window())
+            return
+        else:
+            self.lyrics[idx].text = new_text
+
+        self.lyric_changed.emit()
+        self.state_committed.emit(old_state, (clone_lyrics(self.lyrics), clone_anchors(self.filter_anchors)))
+        self.update()
         
     def mousePressEvent(self, event):
         x = event.position().x()
@@ -870,8 +931,13 @@ class AudioTimelineWidget(QWidget):
             return
         
         if event.button() == Qt.MouseButton.LeftButton:
-            # 双击直接吸附最近的歌词
+            # 双击歌词文本块：编辑文本；双击空白：吸附最近歌词
             if event.type() == QEvent.Type.MouseButtonDblClick:
+                # 优先判断是否双击在某个歌词文本块上
+                hit_label_idx = self._get_hit_lyric_label(x, y)
+                if hit_label_idx != -1:
+                    self._edit_lyric_text(hit_label_idx)
+                    return
                 time_sec = x / self.zoom
                 if self.lyrics:
                     old_state = (clone_lyrics(self.lyrics), clone_anchors(self.filter_anchors))
@@ -892,7 +958,9 @@ class AudioTimelineWidget(QWidget):
                 return
 
             # 判断是否点中了歌词句柄
-            idx = self._get_hit_lyric(x)
+            idx = self._get_hit_lyric_label(x, y)
+            if idx == -1:
+                idx = self._get_hit_lyric(x)
             if idx != -1:
                 # Ctrl+点击切换选择状态
                 if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
@@ -952,7 +1020,11 @@ class AudioTimelineWidget(QWidget):
         else:
             # Hover 效果
             idx_a = self._get_hit_anchor(x)
-            idx_l = self._get_hit_lyric(x) if idx_a == -1 else -1
+            idx_l = -1
+            if idx_a == -1:
+                idx_l = self._get_hit_lyric_label(x, y)
+                if idx_l == -1:
+                    idx_l = self._get_hit_lyric(x)
 
             if idx_a != self.hover_anchor_idx or idx_l != self.hover_idx:
                 self.hover_anchor_idx = idx_a
@@ -1167,7 +1239,7 @@ class AudioTimelineWidget(QWidget):
             painter.drawLine(int(lx), ruler_h, int(lx), h)
             
             y_offset = ruler_h + 5 + (i % 5) * 28
-            text = ev.text
+            text = ev.text if ev.text else " "
             if is_drag:
                 text = f"{text} [{ev.time_seconds:.3f}s]"
                 
@@ -1359,7 +1431,7 @@ class LyricCalibratorWidget(QWidget):
         self.btn_stop.clicked.connect(self.stop_play)
         toolbar.addWidget(self.btn_stop)
 
-        toolbar.addSpacing(8)
+        toolbar.addSpacing(4)
 
         # 过滤锚点（|← 起始，→| 结束）
         toolbar_icon_size = self.btn_play.iconSize()
@@ -1378,6 +1450,14 @@ class LyricCalibratorWidget(QWidget):
         self.btn_filter_end.setToolTip("放置过滤结束锚点 (])")
         self.btn_filter_end.clicked.connect(self.place_filter_end)
         toolbar.addWidget(self.btn_filter_end)
+
+        # 插入歌词锚点（空白，双击文本块后填写）
+        self.btn_insert_lyric_anchor = TransparentToolButton(FIF.ADD, self)
+        self.btn_insert_lyric_anchor.setIconSize(toolbar_icon_size)
+        self.btn_insert_lyric_anchor.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_insert_lyric_anchor.setToolTip("插入歌词锚点 (M)")
+        self.btn_insert_lyric_anchor.clicked.connect(self.insert_lyric_anchor)
+        toolbar.addWidget(self.btn_insert_lyric_anchor)
         
         self.volume_slider = Slider(Qt.Orientation.Horizontal, self)
         self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1387,7 +1467,7 @@ class LyricCalibratorWidget(QWidget):
         self.volume_slider.valueChanged.connect(lambda v: self.player.set_volume(v / 100.0))
         toolbar.addWidget(self.volume_slider)
         
-        toolbar.addSpacing(15)
+        toolbar.addSpacing(8)
         
         # 音频设置
         self.btn_audio_settings = TransparentToolButton(FIF.SETTING, self)
@@ -1396,7 +1476,7 @@ class LyricCalibratorWidget(QWidget):
         self.btn_audio_settings.clicked.connect(self.show_audio_settings)
         toolbar.addWidget(self.btn_audio_settings)
         
-        toolbar.addSpacing(15)
+        toolbar.addSpacing(8)
         
         # 倍速控制
         toolbar.addWidget(BodyLabel("倍速:", self))
@@ -1407,7 +1487,7 @@ class LyricCalibratorWidget(QWidget):
         self.speed_combo.currentIndexChanged.connect(self.change_speed)
         toolbar.addWidget(self.speed_combo)
         
-        toolbar.addSpacing(15)
+        toolbar.addSpacing(8)
         
         # 偏好设置
         self.auto_scroll_check = CheckBox("播放时跟随滚动", self)
@@ -1518,6 +1598,11 @@ class LyricCalibratorWidget(QWidget):
         filter_end_shortcut = QShortcut(QKeySequence(Qt.Key.Key_BracketRight), self)
         filter_end_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         filter_end_shortcut.activated.connect(self.place_filter_end)
+
+        # 插入歌词锚点快捷键 M
+        insert_anchor_shortcut = QShortcut(QKeySequence("M"), self)
+        insert_anchor_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        insert_anchor_shortcut.activated.connect(self.insert_lyric_anchor)
         
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1760,6 +1845,19 @@ class LyricCalibratorWidget(QWidget):
         
     def place_filter_end(self):
         self.timeline_widget.set_filter_end(self.smooth_play_time)
+
+    def insert_lyric_anchor(self):
+        """在播放头位置插入一个空白歌词锚点"""
+        tw = self.timeline_widget
+        if tw.duration <= 0:
+            return
+        old_state = (clone_lyrics(tw.lyrics), clone_anchors(tw.filter_anchors))
+        sec = max(0.0, min(tw.duration, self.smooth_play_time))
+        tw.lyrics.append(LyricEvent(time_seconds=sec, text="", source_line=-1))
+        tw.lyrics.sort(key=lambda x: x.time_seconds)
+        tw.lyric_changed.emit()
+        tw.state_committed.emit(old_state, (clone_lyrics(tw.lyrics), clone_anchors(tw.filter_anchors)))
+        tw.update()
         
     def save_lyrics(self):
         original_events = self.timeline_widget.lyrics
@@ -1897,11 +1995,16 @@ class LyricCalibratorWidget(QWidget):
             
         # 根据 source_line 进行精准替换
         event_dict = {}
+        extra_events = []
         for ev in updated_events:
             # 记录每一行对应的最新事件列表
-            if ev.source_line not in event_dict:
-                event_dict[ev.source_line] = []
-            event_dict[ev.source_line].append(ev)
+            if isinstance(ev.source_line, int) and ev.source_line > 0:
+                if ev.source_line not in event_dict:
+                    event_dict[ev.source_line] = []
+                event_dict[ev.source_line].append(ev)
+            else:
+                # 新插入锚点等无原始行号的事件，追加写入
+                extra_events.append(ev)
             
         with open(out_path, "w", encoding="utf-8-sig") as f:
             for i, line in enumerate(lines, start=1):
@@ -1992,3 +2095,27 @@ class LyricCalibratorWidget(QWidget):
                         f.write("（过滤）" + cleaned_line)
                     else:
                         f.write(cleaned_line)
+
+            # 追加写入新插入的歌词锚点（无 source_line）
+            if extra_events:
+                f.write("\n")
+                extra_events.sort(key=lambda x: x.time_seconds)
+                for idx, ev in enumerate(extra_events):
+                    if not ev.text:
+                        continue
+                    minutes = int(ev.time_seconds // 60)
+                    seconds = ev.time_seconds % 60
+                    if detected_format == ".lrc":
+                        f.write(f"[{minutes:02d}:{seconds:05.2f}]{ev.text}\n")
+                    elif detected_format == ".ksc":
+                        end_time_sec = ev.time_seconds + 0.5
+                        if idx + 1 < len(extra_events):
+                            end_time_sec = min(end_time_sec, extra_events[idx + 1].time_seconds)
+                        e_min = int(end_time_sec // 60)
+                        e_sec = end_time_sec % 60
+                        f.write(
+                            f"karaoke.add('{minutes:02d}:{seconds:06.3f}', "
+                            f"'{e_min:02d}:{e_sec:06.3f}', '[{ev.text}]', '500');\n"
+                        )
+                    else:
+                        f.write(f"{ev.time_seconds:.3f}\t{ev.text}\n")

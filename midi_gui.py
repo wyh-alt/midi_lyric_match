@@ -21,6 +21,34 @@ from qfluentwidgets import (
 import mido
 import matplotlib
 matplotlib.use('QtAgg')
+
+
+def _app_base_dir() -> str:
+    """源码运行时为脚本目录；PyInstaller 单文件为 _MEIPASS 解压目录。"""
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_app_icon() -> QIcon:
+    icon_path = os.path.join(_app_base_dir(), "icon.ico")
+    if os.path.exists(icon_path):
+        return QIcon(icon_path)
+    return QIcon()
+
+
+def _set_windows_app_user_model_id():
+    """避免 Windows 任务栏将 PyInstaller 程序归为 python.exe，导致图标不显示。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "MIDIAnalysisTool.LyricMatch.Calibrator.1"
+        )
+    except Exception:
+        pass
+
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -661,10 +689,7 @@ class MainWindow(FluentWindow):
         super().__init__()
         self.setWindowTitle("MIDI & 歌词处理工具箱")
         
-        # 设置窗口图标
-        icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+        self.setWindowIcon(load_app_icon())
             
         self.resize(1100, 750)
         
@@ -759,26 +784,20 @@ class MainWindow(FluentWindow):
 
 
 def main():
-    # 解决 Windows 任务栏图标可能不显示的问题
-    import ctypes
-    try:
-        myappid = 'mycompany.myproduct.subproduct.version' # 任意自定义的字符串
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-    except Exception:
-        pass
+    _set_windows_app_user_model_id()
 
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     app = QApplication(sys.argv)
-    
-    # 设置应用程序全局图标
-    icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
-    if os.path.exists(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
+    app_icon = load_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
         
     setTheme(Theme.AUTO)
     
     w = MainWindow()
+    if not app_icon.isNull():
+        w.setWindowIcon(app_icon)
     w.show()
     sys.exit(app.exec())
 

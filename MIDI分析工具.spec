@@ -1,11 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
+SPEC_DIR = os.path.dirname(os.path.abspath(SPEC))
+ICON_PATH = os.path.join(SPEC_DIR, 'icon.ico')
 
 a = Analysis(
     ['midi_gui.py'],
-    pathex=[],
+    pathex=[SPEC_DIR],
     binaries=[],
-    datas=[],
+    datas=[(ICON_PATH, '.')] if os.path.isfile(ICON_PATH) else [],
     hiddenimports=[
         'numpy', 'soundfile', 'sounddevice', '_soundfile_data',
         'PyQt6', 'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets',
@@ -40,5 +43,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['icon.ico'],
+    icon=ICON_PATH if os.path.isfile(ICON_PATH) else None,
 )
